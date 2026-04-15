@@ -1,0 +1,1 @@
+This restructured "Top-Down" approach ensures all variables are properly initialized before you attempt to attach logic to them. I have also added an App Category Filter. This acts as a "Fast Maneuver" sidebar, allowing you to quickly filter for "Browsers" or "Media Players" rather than scrolling through the entire registry list.
