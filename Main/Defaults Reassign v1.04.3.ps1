@@ -2,50 +2,6 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 # ==============================================================================
-# STAGE 0: STAGED SECURITY BOOTSTRAP
-# ==============================================================================
-$CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$IsAdmin = ([Security.Principal.WindowsPrincipal]$CurrentIdentity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-$IsSystem = $CurrentIdentity.User.Value -eq "S-1-5-18"
-
-if (-not $IsSystem) {
-    # Attempt to go straight to SYSTEM via Scheduled Task
-    $TaskName = "WinCleanPro_AutoElevator"
-    $Action = New-ScheduledTaskAction -Execute 'PowerShell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
-    $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-    $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-    
-    try {
-        # If this fails, we aren't Admin yet. Catch block will trigger UAC.
-        Register-ScheduledTask -TaskName $TaskName -Action $Action -Principal $Principal -Settings $Settings -Force -ErrorAction Stop | Out-Null
-        Start-ScheduledTask -TaskName $TaskName
-        Start-Sleep -Seconds 1
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-        exit
-    } catch {
-        # Relaunch as Admin to gain the permission to register the SYSTEM task
-        $Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
-        Start-Process powershell.exe -ArgumentList $Arguments -Verb RunAs
-        exit
-    }
-}
-
-# ==============================================================================
-# STAGE 0.5: REGISTRY REDIRECTION (FOR SYSTEM/TI MODE)
-# ==============================================================================
-if ($IsSystem) {
-    # Resolve the logged-in user to ensure we modify YOUR associations, not SYSTEM's
-    $LoggedOnUser = Get-CimInstance Win32_ComputerSystem | Select-Object -ExpandProperty UserName
-    $UserSID = (New-Object System.Security.Principal.NTAccount($LoggedOnUser)).Translate([System.Security.Principal.SecurityIdentifier]).Value
-    $Global:RegBase = "Registry::HKEY_USERS\$UserSID"
-} else {
-    $Global:RegBase = "HKCU:"
-}
-
-if (-not $IsAdmin -and -not $IsSystem) {
-    [System.Windows.Forms.MessageBox]::Show("Application is running in limited mode. Protected system changes will be blocked.", "Security Warning", "OK", "Exclamation")
-}
-# ==============================================================================
 # STAGE 1: GLOBAL STATE & CONFIG
 # ==============================================================================
 $DefaultBackupPath = "$env:USERPROFILE\Documents\WinCleanPro_Backups"
@@ -75,16 +31,16 @@ function Set-Status {
 
 function Get-AssignedApp {
     param([string]$ext)
-    $path = "$Global:RegBase\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$ext\UserChoice"
-    if ($ext -notmatch "^\." -and $ext -match "http|https|mailto") {
-        $path = "$Global:RegBase\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\$ext\UserChoice" 
+    $path = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$ext\UserChoice"
+    if ($ext -notmatch "^\." -and $ext -match "http|https|mailto") { 
+        $path = "HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\$ext\UserChoice" 
     }
     if (Test-Path $path) {
         try { 
             $progId = (Get-ItemProperty $path -ErrorAction SilentlyContinue).ProgId
             if (!$progId) { return "Windows Default" }
 
-            # FIX: Resolve "AppX..." to a friendly name (e.g., "Microsoft Edge" or "Photos")
+            # Attempt to resolve the "AppX..." ProgID to a friendly name (e.g. "Photos")
             $friendlyName = $null
             $regPath = "Registry::HKEY_CLASSES_ROOT\$progId"
             if (Test-Path $regPath) {
@@ -94,7 +50,7 @@ function Get-AssignedApp {
             if ($friendlyName) {
                 return "$friendlyName ($progId)"
             }
-            return $progId 
+            return $progId
         } 
         catch { 
             return "Unknown" 
@@ -114,7 +70,7 @@ function Refresh-RegistryData {
     Set-Status "Scanning Registry..." "Blue"
     $script:RegistryCache = New-Object System.Collections.Generic.List[PSObject]
     try {
-        $RawExts = Get-ChildItem -Path "$Global:RegBase\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts" | 
+        $RawExts = Get-ChildItem -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts" | 
                    Select-Object -ExpandProperty Name | ForEach-Object { $_ -split "\\" | Select-Object -Last 1 }
         $Protocols = @("http", "https", "mailto")
         $Global:Extensions = ($RawExts + $Protocols) | Sort-Object -Unique
@@ -283,12 +239,11 @@ $BtnRelease.Add_Click({
     foreach($row in $selectedRows) {
         $ext = $row.Cells["Ext"].Value
         try {
-            # Determine Registry Path (Handles Protocols vs Extensions)
-            $baseKey = if ($IsSystem) { $Global:RegBase.Replace("Registry::", "") } else { "HKEY_CURRENT_USER" }
-            
-            $basePath = "$baseKey\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$ext"
+            $basePath = "HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$ext"
+            $psPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$ext"
             if ($ext -notmatch "^\." -and $ext -match "http|https|mailto") {
-                $basePath = "$baseKey\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\$ext"
+                $basePath = "HKEY_CURRENT_USER\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\$ext"
+                $psPath = "HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\$ext"
             }
 
             if (!(Test-Path $DefaultBackupPath)) { New-Item $DefaultBackupPath -ItemType Directory -Force }
@@ -296,8 +251,8 @@ $BtnRelease.Add_Click({
             $proc = Start-Process "reg.exe" -ArgumentList "export `"$basePath`" `"$file`"" -Wait -WindowStyle Hidden -PassThru
             
             if ($proc.ExitCode -eq 0) {
-                # FIX: Use native reg.exe delete. This bypasses the PowerShell "subkey does not exist" error 
-                # and forces the removal of the protected UserChoice and OpenWithProgids keys.
+                # Using native reg.exe delete to bypass PowerShell provider issues with protected subkeys.
+                # We delete these subkeys entirely to ensure Windows reverts to its true system default.
                 Start-Process "reg.exe" -ArgumentList "delete `"$basePath\UserChoice`" /f" -Wait -WindowStyle Hidden
                 Start-Process "reg.exe" -ArgumentList "delete `"$basePath\OpenWithProgids`" /f" -Wait -WindowStyle Hidden
                 Write-Log "Released ${ext}"
@@ -306,7 +261,7 @@ $BtnRelease.Add_Click({
         $ProgressBar.PerformStep()
     }
     $ProgressBar.Visible = $false
-    Stop-Process -Name explorer -Force
+    Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
     Refresh-RegistryData
 })
 
@@ -315,8 +270,7 @@ $BtnAssign.Add_Click({
     foreach($row in $selectedRows) {
         $ext = $row.Cells["Ext"].Value
         
-        # FIX: Protocols (http/mailto) cannot be assigned via the "Open With" file picker.
-        # We must redirect the user to the Windows Settings page for these.
+        # Fix for Protocols: Native Picker doesn't work on 'files' for http/mailto
         if ($ext -notmatch "^\." -and $ext -match "http|https|mailto") {
             Write-Log "Opening Windows Default Apps settings for protocol: $ext"
             Start-Process "ms-settings:defaultapps"
@@ -324,14 +278,11 @@ $BtnAssign.Add_Click({
         }
 
         Set-Status "Picker: $ext"
-        # FIX: Ensure extension has a leading dot so Windows recognizes the file type.
+        # Ensure extension has a leading dot for the temp file
         $extDot = if ($ext.StartsWith(".")) { $ext } else { ".$ext" }
         $tempFile = Join-Path $env:TEMP "winclean_temp$extDot"
-        
-        # FIX: Writing dummy content to the file. If the file is 0 bytes (empty), 
-        # the "Always use this app" checkbox often disappears from the picker.
-        Set-Content -Path $tempFile -Value "WinClean Temporary File" -Force
-        
+        # Writing content ensures Windows recognizes the file type, which helps show the "Always use this app" checkbox.
+        Set-Content -Path $tempFile -Value "WinClean Temp Association File" -Force
         Start-Process "rundll32.exe" -ArgumentList "shell32.dll,OpenAs_RunDLL $tempFile" -Wait 
         if (Test-Path $tempFile) { Remove-Item $tempFile -Force }
     }

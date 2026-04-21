@@ -2,50 +2,6 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 # ==============================================================================
-# STAGE 0: STAGED SECURITY BOOTSTRAP
-# ==============================================================================
-$CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$IsAdmin = ([Security.Principal.WindowsPrincipal]$CurrentIdentity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-$IsSystem = $CurrentIdentity.User.Value -eq "S-1-5-18"
-
-if (-not $IsSystem) {
-    # Attempt to go straight to SYSTEM via Scheduled Task
-    $TaskName = "WinCleanPro_AutoElevator"
-    $Action = New-ScheduledTaskAction -Execute 'PowerShell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
-    $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-    $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-    
-    try {
-        # If this fails, we aren't Admin yet. Catch block will trigger UAC.
-        Register-ScheduledTask -TaskName $TaskName -Action $Action -Principal $Principal -Settings $Settings -Force -ErrorAction Stop | Out-Null
-        Start-ScheduledTask -TaskName $TaskName
-        Start-Sleep -Seconds 1
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-        exit
-    } catch {
-        # Relaunch as Admin to gain the permission to register the SYSTEM task
-        $Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
-        Start-Process powershell.exe -ArgumentList $Arguments -Verb RunAs
-        exit
-    }
-}
-
-# ==============================================================================
-# STAGE 0.5: REGISTRY REDIRECTION (FOR SYSTEM/TI MODE)
-# ==============================================================================
-if ($IsSystem) {
-    # Resolve the logged-in user to ensure we modify YOUR associations, not SYSTEM's
-    $LoggedOnUser = Get-CimInstance Win32_ComputerSystem | Select-Object -ExpandProperty UserName
-    $UserSID = (New-Object System.Security.Principal.NTAccount($LoggedOnUser)).Translate([System.Security.Principal.SecurityIdentifier]).Value
-    $Global:RegBase = "Registry::HKEY_USERS\$UserSID"
-} else {
-    $Global:RegBase = "HKCU:"
-}
-
-if (-not $IsAdmin -and -not $IsSystem) {
-    [System.Windows.Forms.MessageBox]::Show("Application is running in limited mode. Protected system changes will be blocked.", "Security Warning", "OK", "Exclamation")
-}
-# ==============================================================================
 # STAGE 1: GLOBAL STATE & CONFIG
 # ==============================================================================
 $DefaultBackupPath = "$env:USERPROFILE\Documents\WinCleanPro_Backups"
@@ -75,9 +31,9 @@ function Set-Status {
 
 function Get-AssignedApp {
     param([string]$ext)
-    $path = "$Global:RegBase\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$ext\UserChoice"
+    $path = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$ext\UserChoice"
     if ($ext -notmatch "^\." -and $ext -match "http|https|mailto") {
-        $path = "$Global:RegBase\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\$ext\UserChoice" 
+        $path = "HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\$ext\UserChoice" 
     }
     if (Test-Path $path) {
         try { 
@@ -114,7 +70,7 @@ function Refresh-RegistryData {
     Set-Status "Scanning Registry..." "Blue"
     $script:RegistryCache = New-Object System.Collections.Generic.List[PSObject]
     try {
-        $RawExts = Get-ChildItem -Path "$Global:RegBase\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts" | 
+        $RawExts = Get-ChildItem -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts" | 
                    Select-Object -ExpandProperty Name | ForEach-Object { $_ -split "\\" | Select-Object -Last 1 }
         $Protocols = @("http", "https", "mailto")
         $Global:Extensions = ($RawExts + $Protocols) | Sort-Object -Unique
@@ -284,11 +240,9 @@ $BtnRelease.Add_Click({
         $ext = $row.Cells["Ext"].Value
         try {
             # Determine Registry Path (Handles Protocols vs Extensions)
-            $baseKey = if ($IsSystem) { $Global:RegBase.Replace("Registry::", "") } else { "HKEY_CURRENT_USER" }
-            
-            $basePath = "$baseKey\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$ext"
+            $basePath = "HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$ext"
             if ($ext -notmatch "^\." -and $ext -match "http|https|mailto") {
-                $basePath = "$baseKey\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\$ext"
+                $basePath = "HKEY_CURRENT_USER\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\$ext"
             }
 
             if (!(Test-Path $DefaultBackupPath)) { New-Item $DefaultBackupPath -ItemType Directory -Force }
