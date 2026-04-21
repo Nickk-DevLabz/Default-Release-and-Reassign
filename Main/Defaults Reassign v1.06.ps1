@@ -7,13 +7,46 @@ Add-Type -AssemblyName System.Drawing
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     $ElevationMsg = "WinClean Pro requires Administrator privileges to take ownership of protected registry keys.`n`nWould you like to relaunch as Administrator?"
     $Response = [System.Windows.Forms.MessageBox]::Show($ElevationMsg, "Elevation Required", "YesNo", "Warning")
+$CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$IsAdmin = ([Security.Principal.WindowsPrincipal]$CurrentIdentity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$IsSystem = $CurrentIdentity.User.Value -eq "S-1-5-18"
+
+if (-not $IsSystem) {
+    # Step 1: Attempt to go straight to SYSTEM (TrustedInstaller level) via Scheduled Task
+    $TaskName = "WinCleanPro_AutoElevator"
+    $Action = New-ScheduledTaskAction -Execute 'PowerShell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
     
     if ($Response -eq "Yes") {
+    try {
+        # This will only succeed if current process is already elevated (Admin)
+        Register-ScheduledTask -TaskName $TaskName -Action $Action -Principal $Principal -Settings $Settings -Force -ErrorAction Stop | Out-Null
+        Start-ScheduledTask -TaskName $TaskName
+        Start-Sleep -Seconds 1
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+        exit
+    } catch {
+        # Step 2: Relaunch as Admin first to gain permission for the SYSTEM task
         $Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
         Start-Process powershell.exe -ArgumentList $Arguments -Verb RunAs
         exit
     }
     # Continue in limited mode if user says no, though most features will fail.
+}
+
+# ==============================================================================
+# STAGE 0.5: REGISTRY REDIRECTION (FOR SYSTEM/TI MODE)
+# ==============================================================================
+if ($IsSystem) {
+    # Resolve the logged-in user to ensure we modify YOUR associations, not SYSTEM's
+    $LoggedOnUser = Get-CimInstance Win32_ComputerSystem | Select-Object -ExpandProperty UserName
+    $UserSID = (New-Object System.Security.Principal.NTAccount($LoggedOnUser)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+    $Global:RegBase = "Registry::HKEY_USERS\$UserSID"
+    $Global:SystemBaseKey = [Microsoft.Win32.Registry]::Users.OpenSubKey($UserSID, $true)
+} else {
+    $Global:RegBase = "HKCU:"
+    $Global:SystemBaseKey = [Microsoft.Win32.Registry]::CurrentUser
 }
 
 # ==============================================================================
@@ -51,18 +84,30 @@ function Grant-RegistryAccess {
         # Take Ownership Logic (TrustedInstaller Bypass)
         $User = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
         $RegKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($Path.Replace("HKCU:\",""), [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [System.Security.AccessControl.RegistryRights]::TakeOwnership)
+        $SubPath = $Path.Replace($Global:RegBase + "\", "").Replace("HKCU:\","").Replace("HKEY_CURRENT_USER\","")
+        
+        # Step 1: Open with TakeOwnership rights
+        $RegKey = $Global:SystemBaseKey.OpenSubKey($SubPath, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [System.Security.AccessControl.RegistryRights]::TakeOwnership)
         $Acl = $RegKey.GetAccessControl()
         $Acl.SetOwner([System.Security.Principal.NTAccount]$User)
         $RegKey.SetAccessControl($Acl)
+        $RegKey.Close()
 
         # Grant Full Control to current user
         $Acl = Get-Acl $Path
+        # Step 2: Grant Full Control using ChangePermissions via the existing handle
+        $RegKey = $Global:SystemBaseKey.OpenSubKey($SubPath, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [System.Security.AccessControl.RegistryRights]::ChangePermissions)
+        $Acl = $RegKey.GetAccessControl()
         $Rule = New-Object System.Security.AccessControl.RegistryAccessRule($User, "FullControl", "Allow")
         $Acl.SetAccessRule($Rule)
         Set-Acl $Path $Acl
+        $RegKey.SetAccessControl($Acl)
+        $RegKey.Close()
+        
         Write-Log "Ownership taken and access granted for: $Path"
     } catch {
         Write-Log "Failed to take ownership of $Path : $_" "WARN"
+        Write-Log "Ownership takeover failed for $Path : $_" "WARN"
     }
 }
 
@@ -70,17 +115,25 @@ function Set-RegistryLock {
     param([string]$Path, [bool]$Lock)
     try {
         $acl = Get-Acl $Path
+        $SubPath = $Path.Replace($Global:RegBase + "\", "").Replace("HKCU:\","").Replace("HKEY_CURRENT_USER\","")
+        $RegKey = $Global:SystemBaseKey.OpenSubKey($SubPath, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [System.Security.AccessControl.RegistryRights]::ChangePermissions)
+        $Acl = $RegKey.GetAccessControl()
+        
         $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
         $rule = New-Object System.Security.AccessControl.RegistryAccessRule($identity, "SetValue,CreateSubKey", "Deny")
         
         if ($Lock) {
             $acl.SetAccessRule($rule)
+            $Acl.SetAccessRule($rule)
             Write-Log "Locked registry path: $Path"
         } else {
             $acl.RemoveAccessRule($rule)
+            $Acl.RemoveAccessRule($rule)
             Write-Log "Unlocked registry path: $Path"
         }
         Set-Acl $Path $acl
+        $RegKey.SetAccessControl($Acl)
+        $RegKey.Close()
     } catch {
         # This often fails if not running as SYSTEM/TrustedInstaller for specific keys
         Write-Log "Lock/Unlock failed for $Path : $_" "WARN"
@@ -90,8 +143,10 @@ function Set-RegistryLock {
 function Get-AssignedApp {
     param([string]$ext)
     $path = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$ext\UserChoice"
+    $path = "$Global:RegBase\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$ext\UserChoice"
     if ($ext -notmatch "^\." -and $ext -match "http|https|mailto") {
         $path = "HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\$ext\UserChoice" 
+        $path = "$Global:RegBase\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\$ext\UserChoice" 
     }
     if (Test-Path $path) {
         try { 
@@ -129,6 +184,7 @@ function Refresh-RegistryData {
     $script:RegistryCache = New-Object System.Collections.Generic.List[PSObject]
     try {
         $RawExts = Get-ChildItem -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts" | 
+        $RawExts = Get-ChildItem -Path "$Global:RegBase\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts" | 
                    Select-Object -ExpandProperty Name | ForEach-Object { $_ -split "\\" | Select-Object -Last 1 }
         $Protocols = @("http", "https", "mailto")
         $Global:Extensions = ($RawExts + $Protocols) | Sort-Object -Unique
@@ -302,8 +358,12 @@ $BtnRelease.Add_Click({
         try {
             # Determine Registry Path (Handles Protocols vs Extensions)
             $basePath = "HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$ext"
+            $baseKey = if ($IsSystem) { $Global:RegBase.Replace("Registry::", "") } else { "HKEY_CURRENT_USER" }
+            
+            $basePath = "$baseKey\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$ext"
             if ($ext -notmatch "^\." -and $ext -match "http|https|mailto") {
                 $basePath = "HKEY_CURRENT_USER\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\$ext"
+                $basePath = "$baseKey\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\$ext"
             }
 
             if (!(Test-Path $DefaultBackupPath)) { New-Item $DefaultBackupPath -ItemType Directory -Force }
@@ -357,6 +417,7 @@ $BtnAssign.Add_Click({
         # ANTI-HIJACK: Lock the new assignment
         if ($ChkLock.Checked) {
             $psPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$ext"
+            $psPath = "$Global:RegBase\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$ext"
             if (Test-Path "$psPath\UserChoice") { Set-RegistryLock -Path "$psPath\UserChoice" -Lock $true }
         }
     }
